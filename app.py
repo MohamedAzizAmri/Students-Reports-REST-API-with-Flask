@@ -10,6 +10,7 @@ from pathlib import Path
 import jwt
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
+from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 app.json.sort_keys = False  # keep field order as written below
@@ -60,7 +61,42 @@ def configure_logging():
 
 configure_logging()
 
+# --------------------------------------------------------------------------- #
+# Database: connection + the two tables (ORM models)
+# --------------------------------------------------------------------------- #
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+db = SQLAlchemy(app)
 
+
+class Student(db.Model):
+    __tablename__ = "student"
+    ID_S = db.Column(db.Integer, primary_key=True)
+    FirstName = db.Column(db.String(100), nullable=False)
+    LastName = db.Column(db.String(100), nullable=False)
+    DoubleMajor = db.Column(db.Boolean, nullable=False)
+    Level = db.Column(db.Integer, nullable=False)
+    # all reports of this student; deleting the student deletes their reports too
+    reports = db.relationship("Report", back_populates="student",
+                              cascade="all, delete-orphan")
+
+
+class Report(db.Model):
+    __tablename__ = "report"
+    ID_R = db.Column(db.Integer, primary_key=True)
+    Title = db.Column(db.String(200), nullable=False)
+    Type = db.Column(db.String(50), nullable=False)
+    K1 = db.Column(db.String(100), nullable=False)
+    K2 = db.Column(db.String(100), nullable=False)
+    K3 = db.Column(db.String(100), nullable=False)
+    ReleaseDate = db.Column(db.Date, nullable=False)
+    # the link to the student, stored in the database itself
+    ID_S = db.Column(db.Integer, db.ForeignKey("student.ID_S"), nullable=False)
+    student = db.relationship("Student", back_populates="reports")
+
+
+# Create the tables if they do not exist yet (this also creates data/app.db)
+with app.app_context():
+    db.create_all()
 # --------------------------------------------------------------------------- #
 # Data: the two lists
 # --------------------------------------------------------------------------- #
