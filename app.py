@@ -6,7 +6,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
-
+from pathlib import Path
 import jwt
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
@@ -29,6 +29,11 @@ PORT = int(os.environ.get("PORT", "5000"))
 DEBUG = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.environ.get("LOG_FILE", "logs/app.log")
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_FILE = BASE_DIR / "data" / "app.db"
+DEFAULT_DB_FILE.parent.mkdir(exist_ok=True)
+DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DEFAULT_DB_FILE.as_posix()}")
 
 LEVELS = [1, 2, 3, 4]  
 REPORT_TYPES = ["Mini senior project", "End-of-studies project"]
