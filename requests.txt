@@ -1,0 +1,29 @@
+
+{"FirstName": "Mohamed", "LastName": "Aziz", "DoubleMajor": false, "Level": 4}
+
+
+{"username": "admin", "password": "admin123"}
+
+
+{"ID_S": 1, "Title": "Sales forecasting with time series", "Type": "End-of-studies project", "K1": "forecasting", "K2": "time series", "K3": "retail", "ReleaseDate": "2027-06-15"}
+
+{"ID_S": 1, "Title": "Sales forecasting with time series", "Type": "End-of-studies project", "K1": "forecasting", "K2": "time series", "K3": "retail", "ReleaseDate": "2027-06-15"}
+
+{"FirstName": "Sara", "LastName": "Ben Ali", "DoubleMajor": true, "Level": 3}
+
+{"ID_S": 2, "Title": "Customer churn analysis", "Type": "Mini senior project", "K1": "churn", "K2": "data mining", "K3": "telecom", "ReleaseDate": "2027-03-10"}
+
+{"ID_S": 99, "Title": "Ghost report", "Type": "Mini senior project", "K1": "a", "K2": "b", "K3": "c", "ReleaseDate": "2027-03-10"}
+
+{"FirstName": "Radhwen", "LastName": "Chaaleb", "DoubleMajor": false, "Level": 7}
+
+
+{"ID_S": 2, "Title": "No third keyword", "Type": "Mini senior project", "K1": "a", "K2": "b", "ReleaseDate": "2027-03-10"}
+
+{"FirstName": "Mohamed", "LastName": "Aziz", "DoubleMajor": false, "Level": 4}
+
+{"username": "admin", "password": "admin123"}
+
+{"refresh_token": "PASTE_REFRESH_TOKEN_HERE"}
+
+{"refresh_token": "PASTE_OLD_REFRESH_TOKEN_HERE"}

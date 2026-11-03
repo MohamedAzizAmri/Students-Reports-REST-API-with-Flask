@@ -1,0 +1,14 @@
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+.vscode
+.env
+logs
+test_api.py
+README.md
+requests.http
+insomnia_requests.txt
