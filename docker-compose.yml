@@ -15,7 +15,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FILE: /app/logs/app.log
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/app.db}
-      volumes:
+    volumes:
       - ./logs:/app/logs
       - ./data:/app/data                        
     restart: unless-stopped

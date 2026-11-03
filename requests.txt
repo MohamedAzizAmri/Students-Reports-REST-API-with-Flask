@@ -1,5 +1,5 @@
 
-{"FirstName": "Mohamed", "LastName": "Aziz", "DoubleMajor": false, "Level": 4}
+{"FirstName": "Mohamed Aziz", "LastName": "Amri", "DoubleMajor": false, "Level": 4}
 
 
 {"username": "admin", "password": "admin123"}

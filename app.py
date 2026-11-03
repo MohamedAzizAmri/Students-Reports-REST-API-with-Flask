@@ -1,16 +1,20 @@
 import hmac
-import itertools
 import logging
 import os
+import sqlite3
 import uuid
-from logging.handlers import RotatingFileHandler
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
 import jwt
 from flask import Flask, jsonify, request
-from werkzeug.exceptions import HTTPException
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event, func, select
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import SQLAlchemyError
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 app.json.sort_keys = False  # keep field order as written below
@@ -22,50 +26,71 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-secret-change-me-before-depl
 ACCESS_TTL = timedelta(minutes=int(os.environ.get("ACCESS_TOKEN_MINUTES", "5")))
 REFRESH_TTL = timedelta(hours=int(os.environ.get("REFRESH_TOKEN_HOURS", "24")))
 
+# A single demo account is enough for the assignment (override with env vars).
 API_USERNAME = os.environ.get("API_USERNAME", "admin")
 API_PASSWORD = os.environ.get("API_PASSWORD", "admin123")
 
-HOST = os.environ.get("HOST", "127.0.0.1")        
+# Server + logging settings (all overridable with environment variables).
+HOST = os.environ.get("HOST", "127.0.0.1")        # used by `python app.py` only
 PORT = int(os.environ.get("PORT", "5000"))
 DEBUG = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.environ.get("LOG_FILE", "logs/app.log")
 
+# Database: a SQLite file in ./data/app.db unless DATABASE_URL says otherwise.
+# The default path is built from this file's location, so it is the same wherever
+# you run from. Use an ABSOLUTE path in DATABASE_URL (Flask-SQLAlchemy would put a
+# relative SQLite path inside a hidden "instance" folder).
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_FILE = BASE_DIR / "data" / "app.db"
-DEFAULT_DB_FILE.parent.mkdir(exist_ok=True)
 DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DEFAULT_DB_FILE.as_posix()}")
 
-LEVELS = [1, 2, 3, 4]  
+_db_url = make_url(DATABASE_URL)
+if _db_url.get_backend_name() == "sqlite" and _db_url.database not in (None, "", ":memory:"):
+    Path(_db_url.database).parent.mkdir(parents=True, exist_ok=True)
+
+LEVELS = [1, 2, 3, 4]  # study year: 1 = Freshman ... 4 = Senior
 REPORT_TYPES = ["Mini senior project", "End-of-studies project"]
+STUDENT_FIELDS = ("FirstName", "LastName", "DoubleMajor", "Level")
+REPORT_FIELDS = ("Title", "Type", "K1", "K2", "K3", "ReleaseDate", "ID_S")
 
 # --------------------------------------------------------------------------- #
 # Logging: console + rotating file (logs/app.log). Never log passwords/tokens.
 # --------------------------------------------------------------------------- #
 def configure_logging():
     formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
-    handlers = [logging.StreamHandler()] 
+    handlers = [logging.StreamHandler()]  # console: visible with `docker logs`
     try:
         os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
         handlers.append(RotatingFileHandler(
             LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
-    except OSError as exc:  
+    except OSError as exc:  # e.g. read-only folder: keep running, console only
         print(f"WARNING: cannot write log file {LOG_FILE!r}: {exc}")
     app.logger.handlers.clear()
     for handler in handlers:
         handler.setFormatter(formatter)
         app.logger.addHandler(handler)
     app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    app.logger.propagate = False  
+    app.logger.propagate = False  # avoid duplicate lines under gunicorn
 
 
 configure_logging()
+
 
 # --------------------------------------------------------------------------- #
 # Database: connection + the two tables (ORM models)
 # --------------------------------------------------------------------------- #
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 db = SQLAlchemy(app)
+
+
+@event.listens_for(Engine, "connect")
+def enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+    """SQLite ignores foreign keys unless asked: switch them on for every connection."""
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 class Student(db.Model):
@@ -89,50 +114,86 @@ class Report(db.Model):
     K2 = db.Column(db.String(100), nullable=False)
     K3 = db.Column(db.String(100), nullable=False)
     ReleaseDate = db.Column(db.Date, nullable=False)
-    # the link to the student, stored in the database itself
-    ID_S = db.Column(db.Integer, db.ForeignKey("student.ID_S"), nullable=False)
+    # the link to the student, stored (and enforced) in the database itself
+    ID_S = db.Column(db.Integer, db.ForeignKey("student.ID_S", ondelete="CASCADE"),
+                     nullable=False)
     student = db.relationship("Student", back_populates="reports")
 
 
 # Create the tables if they do not exist yet (this also creates data/app.db)
 with app.app_context():
     db.create_all()
+
+REVOKED_JTIS = set()  # refresh tokens that were already used (rotation)
+
+
 # --------------------------------------------------------------------------- #
-# Data: the two lists
+# Database helpers
 # --------------------------------------------------------------------------- #
-STUDENTS = []   
-REPORTS = []    
-REVOKED_JTIS = set()  
-
-_student_ids = itertools.count(1)
-_report_ids = itertools.count(1)
-
-
-def reset_state():
-    """Empty everything (used by the tests)."""
-    global _student_ids, _report_ids
-    STUDENTS.clear()
-    REPORTS.clear()
-    REVOKED_JTIS.clear()
-    _student_ids = itertools.count(1)
-    _report_ids = itertools.count(1)
-
-
 def find_student(student_id):
-    return next((s for s in STUDENTS if s["ID_S"] == student_id), None)
+    return db.session.get(Student, student_id)
 
 
 def find_report(report_id):
-    return next((r for r in REPORTS if r["ID_R"] == report_id), None)
+    return db.session.get(Report, report_id)
 
 
-def reports_of(student_id):
-    return [r for r in REPORTS if r["ID_S"] == student_id]
+def get_student_or_404(student_id):
+    student = find_student(student_id)
+    if student is None:
+        raise APIError(404, f"Student {student_id} not found.", "not_found")
+    return student
 
 
-def max_reports(student):
+def get_report_or_404(report_id):
+    report = find_report(report_id)
+    if report is None:
+        raise APIError(404, f"Report {report_id} not found.", "not_found")
+    return report
+
+
+def count_reports(student_id, ignore_report_id=None):
+    query = select(func.count()).select_from(Report).where(Report.ID_S == student_id)
+    if ignore_report_id is not None:
+        query = query.where(Report.ID_R != ignore_report_id)
+    return db.session.scalar(query)
+
+
+def max_reports(double_major):
     """1 report normally, 2 if the student has a double major."""
-    return 2 if student["DoubleMajor"] else 1
+    return 2 if double_major else 1
+
+
+def commit():
+    """Save the changes; on a database error undo them and let the error handler log it."""
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        raise
+
+
+def apply_values(row, values):
+    for field, value in values.items():
+        setattr(row, field, value)
+
+
+def student_to_dict(student, include_reports=True):
+    data = {"ID_S": student.ID_S, "FirstName": student.FirstName,
+            "LastName": student.LastName, "DoubleMajor": student.DoubleMajor,
+            "Level": student.Level}
+    if include_reports:
+        data["reports"] = [report_to_dict(r, include_student=False) for r in student.reports]
+    return data
+
+
+def report_to_dict(report, include_student=True):
+    data = {"ID_R": report.ID_R, "Title": report.Title, "Type": report.Type,
+            "K1": report.K1, "K2": report.K2, "K3": report.K3,
+            "ReleaseDate": report.ReleaseDate.isoformat(), "ID_S": report.ID_S}
+    if include_student and report.student:
+        data["student"] = student_to_dict(report.student, include_reports=False)
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +235,7 @@ def handle_api_error(e):
 
 @app.errorhandler(HTTPException)
 def handle_http_error(e):
+    # 404 unknown URL, 405 wrong method, etc.
     code = e.name.lower().replace(" ", "_")
     log_failed_request(e.code, code, e.description)
     return error_response(e.code, code, e.description)
@@ -181,6 +243,7 @@ def handle_http_error(e):
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
+    # logger.exception writes the full traceback to the log (never to the client)
     app.logger.exception("%s %s -> 500 unhandled %s: %s",
                          request.method, request.path, type(e).__name__, e)
     return error_response(500, "internal_server_error",
@@ -208,6 +271,16 @@ def check_unknown_fields(data, allowed):
                        {"unknown": unknown, "allowed": sorted(allowed)})
 
 
+def partial_body(current_values, allowed):
+    """PATCH: the fields sent replace the current ones, the others stay as they are."""
+    data = json_body()
+    check_unknown_fields(data, allowed)
+    if not data:
+        raise APIError(400, "Send at least one field to update.", "validation_error",
+                       {"body": f"Allowed fields: {', '.join(sorted(allowed))}."})
+    return {**current_values, **data}
+
+
 def clean_string(data, field, errors):
     """Required, non-empty string. On failure the problem is stored in `errors`."""
     value = data.get(field)
@@ -230,7 +303,7 @@ def match_choice(value, choices):
 
 
 def validate_student(data):
-    check_unknown_fields(data, {"FirstName", "LastName", "DoubleMajor", "Level"})
+    check_unknown_fields(data, set(STUDENT_FIELDS))
     errors = {}
     first = clean_string(data, "FirstName", errors)
     last = clean_string(data, "LastName", errors)
@@ -254,8 +327,7 @@ def validate_student(data):
 
 
 def validate_report(data):
-    check_unknown_fields(
-        data, {"ID_S", "Title", "Type", "K1", "K2", "K3", "ReleaseDate"})
+    check_unknown_fields(data, set(REPORT_FIELDS))
     errors = {}
     title = clean_string(data, "Title", errors)
     k1 = clean_string(data, "K1", errors)
@@ -281,8 +353,14 @@ def validate_report(data):
         errors["ReleaseDate"] = "This field is required."
     else:
         try:
-            release = date.fromisoformat(str(data["ReleaseDate"])).isoformat()
+            value = data["ReleaseDate"]
+            if not isinstance(value, str):
+                raise ValueError
+            release = date.fromisoformat(value)
+            if release.isoformat() != value:  # only the strict YYYY-MM-DD form
+                raise ValueError
         except ValueError:
+            release = None
             errors["ReleaseDate"] = "Must be a valid date formatted YYYY-MM-DD."
 
     if errors:
@@ -291,14 +369,14 @@ def validate_report(data):
             "K1": k1, "K2": k2, "K3": k3, "ReleaseDate": release}
 
 
-def ensure_report_allowed(student_id):
+def ensure_report_allowed(student_id, ignore_report_id=None):
     """The student must exist and must not exceed 1 report (2 if double major)."""
     student = find_student(student_id)
     if student is None:
         raise APIError(422, f"Student {student_id} does not exist.",
                        "invalid_reference")
-    if len(reports_of(student_id)) >= max_reports(student):
-        limit = max_reports(student)
+    limit = max_reports(student.DoubleMajor)
+    if count_reports(student_id, ignore_report_id) >= limit:
         raise APIError(
             409,
             f"Student {student_id} already has {limit} report(s), which is the "
@@ -374,75 +452,141 @@ def refresh():
         raise APIError(400, "refresh_token is required.", "validation_error",
                        {"refresh_token": "This field is required."})
     payload = decode_token(token, "refresh")
-    REVOKED_JTIS.add(payload["jti"])  
+    REVOKED_JTIS.add(payload["jti"])  # rotation: a refresh token works only once
     return jsonify(token_pair(payload["sub"]))
 
 
 # --------------------------------------------------------------------------- #
-# Students  
+# Students  (only the GET endpoints require a token)
 # --------------------------------------------------------------------------- #
+def save_student_changes(student, values):
+    """Shared by PUT and PATCH."""
+    if count_reports(student.ID_S) > max_reports(values["DoubleMajor"]):
+        raise APIError(
+            409,
+            "Cannot remove the double major while the student has 2 reports. "
+            "Delete one report first.", "report_limit_reached")
+    apply_values(student, values)
+    commit()
+    app.logger.info("Student %s updated", student.ID_S)
+    return jsonify(student_to_dict(student))
+
+
 @app.post("/students")
 def create_student():
-    student = {"ID_S": next(_student_ids), **validate_student(json_body())}
-    STUDENTS.append(student)
-    app.logger.info("Student %s created", student["ID_S"])
-    response = jsonify(student)
+    student = Student(**validate_student(json_body()))
+    db.session.add(student)
+    commit()
+    app.logger.info("Student %s created", student.ID_S)
+    response = jsonify(student_to_dict(student))
     response.status_code = 201
-    response.headers["Location"] = f"/students/{student['ID_S']}"
+    response.headers["Location"] = f"/students/{student.ID_S}"
     return response
 
 
 @app.get("/students")
 @token_required
 def list_students():
-    return jsonify(STUDENTS)
+    students = db.session.scalars(select(Student).order_by(Student.ID_S)).all()
+    return jsonify([student_to_dict(s) for s in students])
 
 
 @app.get("/students/<int:student_id>")
 @token_required
 def get_student(student_id):
-    student = find_student(student_id)
-    if student is None:
-        raise APIError(404, f"Student {student_id} not found.", "not_found")
-    return jsonify(student)
+    return jsonify(student_to_dict(get_student_or_404(student_id)))
+
+
+@app.put("/students/<int:student_id>")
+def update_student(student_id):
+    student = get_student_or_404(student_id)
+    return save_student_changes(student, validate_student(json_body()))
+
+
+@app.patch("/students/<int:student_id>")
+def patch_student(student_id):
+    student = get_student_or_404(student_id)
+    current = {field: getattr(student, field) for field in STUDENT_FIELDS}
+    merged = partial_body(current, set(STUDENT_FIELDS))
+    return save_student_changes(student, validate_student(merged))
+
+
+@app.delete("/students/<int:student_id>")
+def delete_student(student_id):
+    student = get_student_or_404(student_id)
+    deleted_reports = len(student.reports)
+    db.session.delete(student)  # their reports are deleted with them (cascade)
+    commit()
+    app.logger.info("Student %s deleted (with %s report(s))", student_id, deleted_reports)
+    return jsonify({"message": f"Student {student_id} deleted.",
+                    "deleted_reports": deleted_reports})
 
 
 # --------------------------------------------------------------------------- #
-# Reports  
+# Reports  (free access)
 # --------------------------------------------------------------------------- #
+def save_report_changes(report, values):
+    """Shared by PUT and PATCH."""
+    ensure_report_allowed(values["ID_S"], ignore_report_id=report.ID_R)
+    apply_values(report, values)
+    commit()
+    app.logger.info("Report %s updated", report.ID_R)
+    return jsonify(report_to_dict(report))
+
+
 @app.post("/reports")
 def create_report():
     values = validate_report(json_body())
     ensure_report_allowed(values["ID_S"])
-    report = {"ID_R": next(_report_ids), "Title": values["Title"],
-              "Type": values["Type"], "K1": values["K1"], "K2": values["K2"],
-              "K3": values["K3"], "ReleaseDate": values["ReleaseDate"],
-              "ID_S": values["ID_S"]}
-    REPORTS.append(report)
-    app.logger.info("Report %s created for student %s", report["ID_R"], report["ID_S"])
-    response = jsonify(report)
+    report = Report(**values)
+    db.session.add(report)
+    commit()
+    app.logger.info("Report %s created for student %s", report.ID_R, report.ID_S)
+    response = jsonify(report_to_dict(report))
     response.status_code = 201
-    response.headers["Location"] = f"/reports/{report['ID_R']}"
+    response.headers["Location"] = f"/reports/{report.ID_R}"
     return response
 
 
 @app.get("/reports")
 def list_reports():
-    return jsonify(REPORTS)
+    reports = db.session.scalars(select(Report).order_by(Report.ID_R)).all()
+    return jsonify([report_to_dict(r) for r in reports])
 
 
 @app.get("/reports/<int:report_id>")
 def get_report(report_id):
-    report = find_report(report_id)
-    if report is None:
-        raise APIError(404, f"Report {report_id} not found.", "not_found")
-    return jsonify(report)
+    return jsonify(report_to_dict(get_report_or_404(report_id)))
+
+
+@app.put("/reports/<int:report_id>")
+def update_report(report_id):
+    report = get_report_or_404(report_id)
+    return save_report_changes(report, validate_report(json_body()))
+
+
+@app.patch("/reports/<int:report_id>")
+def patch_report(report_id):
+    report = get_report_or_404(report_id)
+    current = {field: report_to_dict(report)[field] for field in REPORT_FIELDS}
+    merged = partial_body(current, set(REPORT_FIELDS))
+    return save_report_changes(report, validate_report(merged))
+
+
+@app.delete("/reports/<int:report_id>")
+def delete_report(report_id):
+    report = get_report_or_404(report_id)
+    db.session.delete(report)
+    commit()
+    app.logger.info("Report %s deleted", report_id)
+    return jsonify({"message": f"Report {report_id} deleted."})
 
 
 def log_startup():
-    app.logger.info("API starting | access_ttl=%ss refresh_ttl=%ss log_level=%s log_file=%s",
-                    int(ACCESS_TTL.total_seconds()), int(REFRESH_TTL.total_seconds()),
-                    LOG_LEVEL, LOG_FILE)
+    app.logger.info(
+        "API starting | access_ttl=%ss refresh_ttl=%ss log_level=%s log_file=%s database=%s",
+        int(ACCESS_TTL.total_seconds()), int(REFRESH_TTL.total_seconds()),
+        LOG_LEVEL, LOG_FILE, _db_url.get_backend_name())  # never log the full URL
     if SECRET_KEY.startswith("dev-only"):
         app.logger.warning("SECRET_KEY is the built-in development default. "
                            "Set the SECRET_KEY environment variable.")
